@@ -41,7 +41,7 @@
          renegotiate/1,
          peer_renegotiate/1,
          downgrade/2,
-         update_connection_state/3,
+         update_connection_state/4,
          dist_handshake_complete/3]).
 
 %% gen_statem callbacks
@@ -170,12 +170,16 @@ peer_renegotiate(Pid) ->
      gen_statem:call(Pid, renegotiate, ?DEFAULT_TIMEOUT).
 
 %%--------------------------------------------------------------------
--spec update_connection_state(pid(), WriteState::map(), tls_record:tls_version()) -> ok. 
+-spec update_connection_state(pid(), WriteState::map(),
+                              tls_record:tls_version(),
+                              MaxFragLen :: tls_record:tls_max_frag_len()) -> ok.
 %% Description: So TLS connection process can synchronize the 
 %% encryption state to be used when sending application data. 
 %%--------------------------------------------------------------------
-update_connection_state(Pid, NewState, Version) ->
-    gen_statem:cast(Pid, {new_write, NewState, Version}).
+update_connection_state(Pid, NewState, Version, undefined) ->
+    gen_statem:cast(Pid, {new_write, NewState, Version});
+update_connection_state(Pid, NewState, Version, MaxFragLen) ->
+    gen_statem:cast(Pid, {new_write, NewState, Version, MaxFragLen}).
 
 %%--------------------------------------------------------------------
 -spec downgrade(pid(), integer()) -> {ok, ssl_record:connection_state()}
@@ -341,11 +345,21 @@ connection(cast, #alert{} = Alert,  #data{buff = Buff} = StateData0) ->
      end;
 connection(cast, {new_write, WritesState, Version},
            #data{connection_states = ConnectionStates, env = Env} = StateData) ->
-    CW = maps:remove(aead_handle, WritesState),
     hibernate_after(connection,
-                    StateData#data{connection_states = ConnectionStates#{current_write => CW},
-                                   env = Env#env{negotiated_version = Version}}, []);
-%%
+                    StateData#data{connection_states =
+                                       maps:without([max_fragment_length],
+                                                    ConnectionStates#{current_write => 
+                                                                          maps:remove(aead_handle, WritesState)}),
+                                   env =
+                                       Env#env{negotiated_version = Version}}, []);
+connection(cast, {new_write, WritesState, Version, MaxFragLen},
+           #data{connection_states = ConnectionStates, env = Env} = StateData) ->
+    hibernate_after(connection,
+                    StateData#data{connection_states =
+                                       ConnectionStates#{max_fragment_length => MaxFragLen,
+                                                         current_write => maps:remove(aead_handle, WritesState)},
+                                   env =
+                                       Env#env{negotiated_version = Version}}, []);
 connection(info, dist_data,
            #data{env = #env{dist_handle = DHandle}} = StateData) ->
       case dist_data(DHandle) of
@@ -427,7 +441,26 @@ handshake(cast, {new_write, WriteState0, Version},
     {next_state, connection,
      StateData#data{connection_states = ConnectionStates,
                     env = Env#env{negotiated_version = Version,
-                                           key_update_at = KeyUpdateAt}}};
+                                  key_update_at = KeyUpdateAt}}};
+handshake(cast, {new_write, WriteState, Version, MaxFragLen},
+          #data{connection_states = ConnectionStates0,
+                env = #env{key_update_at = KeyUpdateAt0,
+                           role = Role,
+                           num_key_updates = N,
+                           keylog_fun = Fun} = Env} = StateData) ->
+    ConnectionStates = ConnectionStates0#{current_write => WriteState,
+                                          max_fragment_length => MaxFragLen},
+    KeyUpdateAt = key_update_at(Version, WriteState, KeyUpdateAt0),
+    case Version of
+        ?TLS_1_3 ->
+            maybe_traffic_keylog_1_3(Fun, Role, ConnectionStates, N);
+        _ ->
+            ok
+    end,
+    {next_state, connection,
+     StateData#data{connection_states = ConnectionStates,
+                    env = Env#env{negotiated_version = Version,
+                                  key_update_at = KeyUpdateAt}}};
 handshake(info, dist_data, _) ->
     {keep_state_and_data, [postpone]};
 handshake(info, tick, _) ->
